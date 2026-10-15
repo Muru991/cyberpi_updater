@@ -18,21 +18,29 @@ from __future__ import annotations
 
 import argparse
 import base64
+import enum
 import hashlib
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_for_futures
+from dataclasses import asdict, dataclass
 from datetime import datetime
+from http.client import HTTPMessage
 from pathlib import Path
+from typing import Any, TextIO
 
 try:
     from serial.tools import list_ports
@@ -42,23 +50,40 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 FIRMWARE_DIR = ROOT / "firmware"
 FIRMWARE_META = FIRMWARE_DIR / "latest.json"
+REGION_CACHE_DIR = FIRMWARE_DIR / ".regions"
 LOG_DIR = ROOT / "logs"
 BACKUP_DIR = ROOT / "backups"
+TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
 
 # USB-serial chip on the CyberPi (WCH CH340), as declared by mBlock's CyberPi extension.
 USB_VID, USB_PID = 0x1A86, 0x7523
 
-# Flash parameters used by mBlock's built-in ESP32 flasher for the CyberPi.
-FLASH_ADDR = "0x1000"
-FLASH_ARGS = ["--flash-mode", "dio", "--flash-size", "8MB", "--flash-freq", "keep"]
+# Flash layout and parameters used by mBlock's built-in ESP32 flasher for the CyberPi.
+FLASH_START = 0x0
 FLASH_SIZE = 8 * 1024 * 1024
+IMAGE_ADDR = 0x1000  # the image starts with the bootloader
+IMAGE_FLASH_ARGS = ("--flash-mode", "dio", "--flash-size", "8MB", "--flash-freq", "keep")
+ESP_IMAGE_MAGIC = 0xE9
+
+# ESP-IDF partition table: a 4 KB sector holding up to 0xC00 bytes of 32-byte entries.
 PARTITION_TABLE_ADDR = 0x8000
+PARTITION_TABLE_SECTOR = 0x1000
+PARTITION_TABLE_MAX_LEN = 0xC00
+PARTITION_ENTRY = struct.Struct("<2sBBII16sI")  # magic, type, subtype, offset, size, label, flags
+PARTITION_MAGIC = b"\xaa\x50"
 PARTITION_TYPE_APP = 0
 
 # The CyberPi's CH340 stops responding at 921600 baud. 460800 works for writing (every
 # block is acknowledged and checksummed), but reading back at 460800 loses bytes.
 DEFAULT_BAUD = 460800
 READ_BAUD = 230400
+FALLBACK_BAUD = 115200
+
+WATCH_MAX_JOBS = 32
+WATCH_POLL_SECONDS = 1.0
+WATCH_SETTLE_SECONDS = 1.5  # time a freshly plugged device needs to finish enumerating
+PROGRESS_STEP = 25  # report progress every 25 %
+HTTP_TIMEOUT = 120
 
 # mBlock web loads the CyberPi extension from here; the extension names the firmware file.
 EXT_LIST_URL = (
@@ -73,9 +98,72 @@ FIRMWARE_RE = re.compile(
 
 PROGRESS_RE = re.compile(r"(Writing|Reading) (?:at|from) .*?(\d+(?:\.\d+)?)%")
 MAC_RE = re.compile(r"MAC:\s+([0-9a-f]{2}(?::[0-9a-f]{2}){5})")
-ESP_IMAGE_MAGIC = 0xE9
+
+# esptool runs in its own process group, so Ctrl+C in the terminal doesn't cut a flash
+# short. What happens to running updates on Ctrl+C is decided by UpdateRunner.
+ESPTOOL_ENV = {**os.environ, "NO_COLOR": "1", "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+ESPTOOL_ISOLATION: dict[str, Any]
+if sys.platform == "win32":
+    ESPTOOL_ISOLATION = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+else:
+    ESPTOOL_ISOLATION = {"start_new_session": True}
+
+ABORTED_EXIT_CODE = 130
 
 print_lock = threading.Lock()
+running_esptools: set[subprocess.Popen[str]] = set()
+running_esptools_lock = threading.Lock()
+abort_requested = threading.Event()
+
+
+class Status(enum.Enum):
+    UPDATED = "updated"
+    UP_TO_DATE = "up-to-date"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class Result:
+    port: str
+    status: Status
+    detail: str = ""
+    seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteFirmware:
+    """The firmware image mBlock's CyberPi extension currently points to."""
+
+    version: str
+    url: str
+    filename: str
+    extension: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FirmwareMeta:
+    """What `fetch` stored in firmware/latest.json about the downloaded image."""
+
+    version: str
+    file: str
+    md5: str
+    size: int
+    url: str
+    extension: str | None
+    fetched_at: str
+
+    @property
+    def path(self) -> Path:
+        return FIRMWARE_DIR / self.file
+
+
+@dataclass(frozen=True, slots=True)
+class FlashPlan:
+    """How to update a device. Shared read-only by all worker threads."""
+
+    write_args: tuple[str, ...]
+    verify_args: tuple[str, ...]  # empty when every device is reflashed (--force)
+    bauds: tuple[int, ...]  # first attempt, then the fallback
 
 
 def say(port: str, message: str) -> None:
@@ -84,18 +172,35 @@ def say(port: str, message: str) -> None:
         print(f"{datetime.now():%H:%M:%S}  {name:<24} {message}", flush=True)
 
 
+def timestamp() -> str:
+    return datetime.now().strftime(TIMESTAMP_FORMAT)
+
+
+def display_path(path: Path) -> str:
+    """The path relative to the project when it is inside it, for shorter messages."""
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def write_atomically(path: Path, data: bytes) -> None:
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
+        tmp.write(data)
+    os.replace(tmp.name, path)
+
+
 # --------------------------------------------------------------------------- firmware
 
 
-def http_get(url: str) -> tuple[bytes, dict]:
+def http_get(url: str) -> tuple[bytes, HTTPMessage]:
     req = urllib.request.Request(url, headers={"User-Agent": "cyberpi-updater"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        return resp.read(), dict(resp.headers)
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        return resp.read(), resp.headers
 
 
-def fetch_firmware() -> Path:
-    """Download the firmware that mBlock currently ships for the CyberPi."""
-    print("Looking up the CyberPi extension used by mBlock...")
+def find_remote_firmware() -> RemoteFirmware:
+    """Ask mBlock which firmware image its CyberPi extension currently ships."""
     body, _ = http_get(EXT_LIST_URL)
     exts = json.loads(body)["data"]["list"]
     ext = next((e for e in exts if e.get("extId") == "cyberpi"), None)
@@ -111,49 +216,63 @@ def fetch_firmware() -> Path:
             "pass a firmware file with --firmware instead."
         )
     version, res_path = match.groups()
-    url = ext["extractPath"] + res_path
-    filename = res_path.rsplit("/", 1)[-1].split("_", 1)[-1]  # drop the hash prefix
-    target = FIRMWARE_DIR / filename
+    return RemoteFirmware(
+        version=version,
+        url=ext["extractPath"] + res_path,
+        filename=res_path.rsplit("/", 1)[-1].split("_", 1)[-1],  # drop the hash prefix
+        extension=ext.get("commitId"),
+    )
 
-    meta = read_firmware_meta()
-    if meta and meta.get("url") == url and (FIRMWARE_DIR / meta["file"]).exists():
-        print(f"Firmware {version} is already downloaded: {target.relative_to(ROOT)}")
-        return target
 
-    print(f"Downloading firmware {version} ({filename})...")
-    data, headers = http_get(url)
+def download_firmware(remote: RemoteFirmware) -> FirmwareMeta:
+    print(f"Downloading firmware {remote.version} ({remote.filename})...")
+    data, headers = http_get(remote.url)
     md5 = hashlib.md5(data).hexdigest()
-    expected = headers.get("Content-MD5") or headers.get("content-md5")
+    expected = headers.get("Content-MD5")
     if expected and base64.b64decode(expected).hex() != md5:
         sys.exit("Download is corrupted (MD5 mismatch). Please try again.")
     if not data or data[0] != ESP_IMAGE_MAGIC:
         sys.exit("Downloaded file does not look like an ESP32 flash image.")
 
-    FIRMWARE_DIR.mkdir(exist_ok=True)
-    target.write_bytes(data)
-    FIRMWARE_META.write_text(
-        json.dumps(
-            {
-                "version": version,
-                "file": filename,
-                "md5": md5,
-                "size": len(data),
-                "url": url,
-                "extension": ext.get("commitId"),
-                "fetched_at": datetime.now().isoformat(timespec="seconds"),
-            },
-            indent=2,
-        )
-        + "\n"
+    meta = FirmwareMeta(
+        version=remote.version,
+        file=remote.filename,
+        md5=md5,
+        size=len(data),
+        url=remote.url,
+        extension=remote.extension,
+        fetched_at=datetime.now().isoformat(timespec="seconds"),
     )
-    print(f"Saved {target.relative_to(ROOT)} ({len(data) / 1e6:.1f} MB, md5 {md5})")
-    return target
+    FIRMWARE_DIR.mkdir(exist_ok=True)
+    meta.path.write_bytes(data)
+    FIRMWARE_META.write_text(json.dumps(asdict(meta), indent=2) + "\n", encoding="utf-8")
+    print(f"Saved {display_path(meta.path)} ({len(data) / 1e6:.1f} MB, md5 {md5})")
+    return meta
 
 
-def read_firmware_meta() -> dict | None:
+def fetch_firmware() -> FirmwareMeta:
+    """Download the firmware mBlock currently ships for the CyberPi, unless already here."""
+    print("Looking up the CyberPi extension used by mBlock...")
     try:
-        return json.loads(FIRMWARE_META.read_text())
-    except (OSError, ValueError):
+        remote = find_remote_firmware()
+        meta = read_firmware_meta()
+        if meta and meta.url == remote.url and meta.path.is_file():
+            print(f"Firmware {meta.version} is already downloaded: {display_path(meta.path)}")
+            return meta
+        return download_firmware(remote)
+    except (urllib.error.URLError, TimeoutError) as exc:
+        sys.exit(f"Could not download from Makeblock: {exc}")
+    except (KeyError, TypeError, ValueError) as exc:
+        sys.exit(
+            f"Makeblock's server answered in an unexpected format ({exc!r}); "
+            "pass a firmware file with --firmware instead."
+        )
+
+
+def read_firmware_meta() -> FirmwareMeta | None:
+    try:
+        return FirmwareMeta(**json.loads(FIRMWARE_META.read_text(encoding="utf-8")))
+    except (OSError, TypeError, ValueError):
         return None
 
 
@@ -166,12 +285,55 @@ def resolve_firmware(path: str | None) -> tuple[Path, str]:
         return firmware, firmware.name
 
     meta = read_firmware_meta()
-    if meta and (FIRMWARE_DIR / meta["file"]).is_file():
-        return FIRMWARE_DIR / meta["file"], f"{meta['version']} ({meta['file']})"
+    if not (meta and meta.path.is_file()):
+        print("No firmware downloaded yet.")
+        meta = fetch_firmware()
+    return meta.path, f"{meta.version} ({meta.file})"
 
-    print("No firmware downloaded yet.")
-    firmware = fetch_firmware()
-    return firmware, f"{read_firmware_meta()['version']} ({firmware.name})"
+
+def unchanging_regions(image: bytes) -> list[tuple[int, int]]:
+    """Flash ranges of the image that the firmware never rewrites.
+
+    Once a CyberPi boots, it writes its settings (nvs) and file system (storage), so
+    comparing the whole image would never match. The bootloader, partition table and app
+    partitions stay identical as long as the firmware is the same.
+    """
+    table_start = PARTITION_TABLE_ADDR - IMAGE_ADDR
+    table = image[table_start : table_start + PARTITION_TABLE_MAX_LEN]
+    regions = [(IMAGE_ADDR, PARTITION_TABLE_ADDR + PARTITION_TABLE_SECTOR)]
+    for offset in range(0, len(table) - PARTITION_ENTRY.size + 1, PARTITION_ENTRY.size):
+        magic, ptype, _, start, size, _, _ = PARTITION_ENTRY.unpack_from(table, offset)
+        if magic != PARTITION_MAGIC:
+            break
+        if ptype == PARTITION_TYPE_APP:
+            regions.append((start, start + size))
+    if len(regions) == 1:  # no partition table found, compare the whole image
+        return [(IMAGE_ADDR, IMAGE_ADDR + len(image))]
+    return regions
+
+
+def verify_args(firmware: Path) -> tuple[str, ...]:
+    """esptool arguments that check whether a device already runs `firmware`."""
+    image = firmware.read_bytes()
+    cache = REGION_CACHE_DIR / hashlib.md5(image).hexdigest()
+    cache.mkdir(parents=True, exist_ok=True)
+    args = ["verify-flash"]
+    for start, end in unchanging_regions(image):
+        chunk = image[start - IMAGE_ADDR : end - IMAGE_ADDR]
+        if chunk:
+            path = cache / f"{start:#08x}.bin"
+            if not path.is_file():
+                write_atomically(path, chunk)
+            args += [f"{start:#x}", str(path)]
+    return tuple(args)
+
+
+def make_plan(firmware: Path, args: argparse.Namespace) -> FlashPlan:
+    return FlashPlan(
+        write_args=("write-flash", *IMAGE_FLASH_ARGS, f"{IMAGE_ADDR:#x}", str(firmware)),
+        verify_args=() if args.force else verify_args(firmware),
+        bauds=(args.baud, args.fallback_baud) if args.fallback_baud else (args.baud,),
+    )
 
 
 # --------------------------------------------------------------------------- devices
@@ -187,20 +349,28 @@ def find_cyberpis() -> list[str]:
     return sorted(ports.values())
 
 
-@dataclass
-class Result:
-    port: str
-    status: str  # "updated", "up-to-date" or "failed"
-    detail: str = ""
-    seconds: float = 0.0
+def is_connected(port: str) -> bool:
+    return any(p.device == port for p in list_ports.comports())
 
 
-def open_log(port: str, action: str):
+def single_port(port: str | None) -> str:
+    if port:
+        return port
+    ports = find_cyberpis()
+    if len(ports) != 1:
+        found = "".join(f"\n  {p}" for p in ports)
+        sys.exit(
+            f"Found {len(ports)} CyberPis. Plug in exactly one, or pick one with --port.{found}"
+        )
+    return ports[0]
+
+
+def open_log(port: str, action: str) -> TextIO:
     LOG_DIR.mkdir(exist_ok=True)
-    return open(LOG_DIR / f"{datetime.now():%Y%m%d-%H%M%S}_{action}_{Path(port).name}.log", "w")
+    return open(LOG_DIR / f"{timestamp()}_{action}_{Path(port).name}.log", "w", encoding="utf-8")
 
 
-def run_esptool(port: str, baud: int, command: list[str], log) -> tuple[int, list[str]]:
+def run_esptool(port: str, baud: int, command: Sequence[str], log: TextIO) -> tuple[int, list[str]]:
     """Run one esptool command against a CyberPi, reporting progress as it goes."""
     cmd = [
         sys.executable, "-m", "esptool",
@@ -211,28 +381,57 @@ def run_esptool(port: str, baud: int, command: list[str], log) -> tuple[int, lis
     log.write(f"$ {' '.join(cmd)}\n")
     log.flush()
 
-    env = {**os.environ, "NO_COLOR": "1", "PYTHONUNBUFFERED": "1"}
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
-    )
     lines: list[str] = []
-    next_report = 25
-    for line in proc.stdout:
-        log.write(line)
-        line = line.strip()
-        if not line:
-            continue
-        lines.append(line)
-        if line.startswith("Connecting"):
-            say(port, "connecting...")
-        elif m := PROGRESS_RE.search(line):
-            pct = float(m.group(2))
-            if pct >= next_report and pct < 100:
-                say(port, f"{m.group(1).lower()} {pct:3.0f}%")
-                next_report = (int(pct) // 25 + 1) * 25
-        elif line.startswith("Verifying written data"):
-            say(port, "verifying...")
-    return proc.wait(), lines
+    next_report = PROGRESS_STEP
+    with running_esptools_lock:
+        if abort_requested.is_set():
+            log.write("Not started: aborted with Ctrl+C.\n")
+            return ABORTED_EXIT_CODE, ["aborted with Ctrl+C"]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            env=ESPTOOL_ENV,
+            **ESPTOOL_ISOLATION,
+        )
+        running_esptools.add(proc)
+    with proc:
+        assert proc.stdout is not None
+        try:
+            for raw in proc.stdout:
+                log.write(raw)
+                line = raw.strip()
+                if not line:
+                    continue
+                lines.append(line)
+                if line.startswith("Connecting"):
+                    say(port, "connecting...")
+                elif m := PROGRESS_RE.search(line):
+                    pct = float(m.group(2))
+                    if next_report <= pct < 100:
+                        say(port, f"{m.group(1).lower()} {pct:3.0f}%")
+                        next_report = (int(pct) // PROGRESS_STEP + 1) * PROGRESS_STEP
+                elif line.startswith("Verifying written data"):
+                    say(port, "verifying...")
+        except KeyboardInterrupt:  # only reaches here when run from the main thread
+            proc.kill()
+            raise
+        finally:
+            with running_esptools_lock:
+                running_esptools.discard(proc)
+    if proc.returncode != 0 and abort_requested.is_set():
+        lines.append("aborted with Ctrl+C")
+    return proc.returncode, lines
+
+
+def abort_esptools() -> None:
+    """Kill the running esptool processes and refuse to start new ones."""
+    with running_esptools_lock:
+        abort_requested.set()
+        for proc in running_esptools:
+            proc.kill()
 
 
 def device_mac(lines: list[str]) -> str | None:
@@ -249,97 +448,122 @@ def error_summary(lines: list[str]) -> str:
     return lines[-1] if lines else "esptool produced no output"
 
 
-def code_regions(firmware: Path) -> list[str]:
-    """esptool address/file arguments for the parts of the image the firmware never rewrites.
-
-    Once a CyberPi boots, it writes its settings (nvs) and file system (storage), so
-    comparing the whole image would never match. The bootloader, partition table and app
-    partitions stay identical as long as the firmware is the same.
-    """
-    data = firmware.read_bytes()
-    base = int(FLASH_ADDR, 16)
-    table = data[PARTITION_TABLE_ADDR - base : PARTITION_TABLE_ADDR - base + 0xC00]
-    regions = [(base, PARTITION_TABLE_ADDR + 0x1000)]  # bootloader and partition table
-    for i in range(0, len(table), 32):
-        if table[i : i + 2] != b"\xaa\x50":
-            break
-        ptype, _, offset, size = struct.unpack("<BBII", table[i + 2 : i + 12])
-        if ptype == PARTITION_TYPE_APP:
-            regions.append((offset, offset + size))
-    if len(regions) == 1:  # no partition table found, compare the whole image
-        regions = [(base, base + len(data))]
-
-    cache = FIRMWARE_DIR / ".regions" / hashlib.md5(data).hexdigest()
-    cache.mkdir(parents=True, exist_ok=True)
-    args = []
-    for start, end in regions:
-        chunk = data[start - base : end - base]
-        if chunk:
-            path = cache / f"{start:#08x}.bin"
-            if not path.exists():
-                path.write_bytes(chunk)
-            args += [f"{start:#x}", str(path)]
-    return args
+def failure_detail(lines: list[str], log: TextIO) -> str:
+    return f"{error_summary(lines)}  (log: {display_path(Path(log.name))})"
 
 
-def flash_device(port: str, firmware: Path, args) -> Result:
+def flash_device(port: str, plan: FlashPlan) -> Result:
     started = time.monotonic()
-    bauds = [args.baud] + ([args.fallback_baud] if args.fallback_baud else [])
-    write = ["write-flash", *FLASH_ARGS, FLASH_ADDR, str(firmware)]
-    verify = ["verify-flash", *code_regions(firmware)]
-    needs_update = args.force
 
+    def result(status: Status, detail: str = "") -> Result:
+        return Result(port, status, detail, time.monotonic() - started)
+
+    needs_update = not plan.verify_args
+    lines: list[str] = []
     with open_log(port, "flash") as log:
-        for attempt, baud in enumerate(bauds):
+        for attempt, baud in enumerate(plan.bauds):
             if attempt == 0:
                 say(port, f"starting at {baud} baud")
-            elif os.path.exists(port):
+            elif is_connected(port):
                 say(port, f"failed, retrying at {baud} baud...")
             else:
                 break  # unplugged, nothing to retry
 
             if not needs_update:
                 say(port, "checking installed firmware...")
-                code, lines = run_esptool(port, baud, verify, log)
+                code, lines = run_esptool(port, baud, plan.verify_args, log)
                 if code == 0:
-                    return Result(port, "up-to-date", seconds=time.monotonic() - started)
+                    return result(Status.UP_TO_DATE)
                 if not any("digest mismatch" in line for line in lines):
                     continue  # could not talk to the device
                 needs_update = True
 
-            code, lines = run_esptool(port, baud, write, log)
+            code, lines = run_esptool(port, baud, plan.write_args, log)
             if code == 0:
-                return Result(port, "updated", seconds=time.monotonic() - started)
-
-    detail = f"{error_summary(lines)}  (log: {Path(log.name).relative_to(ROOT)})"
-    return Result(port, "failed", detail, time.monotonic() - started)
+                return result(Status.UPDATED)
+        return result(Status.FAILED, failure_detail(lines, log))
 
 
 def report(result: Result) -> None:
-    if result.status == "updated":
+    if result.status is Status.UPDATED:
         say(result.port, f"DONE, firmware updated in {result.seconds:.0f}s")
-    elif result.status == "up-to-date":
+    elif result.status is Status.UP_TO_DATE:
         say(result.port, "DONE, already had this firmware (left untouched)")
     else:
         say(result.port, f"FAILED: {result.detail}")
 
 
-def print_summary(counts: Counter) -> None:
-    print(
-        f"\nSummary: {counts['updated']} updated, {counts['up-to-date']} already "
-        f"up to date, {counts['failed']} failed."
-    )
+class UpdateRunner:
+    """Updates devices on worker threads, reporting and counting each result.
+
+    Waiting goes through the futures rather than `ThreadPoolExecutor.shutdown(wait=True)`:
+    on Python < 3.13, Ctrl+C during `Thread.join()` can mark a running worker as finished,
+    and the script would then exit in the middle of a flash.
+    """
+
+    def __init__(self, plan: FlashPlan, max_jobs: int, settle_seconds: float = 0.0) -> None:
+        self._plan = plan
+        self._settle_seconds = settle_seconds
+        self._pool = ThreadPoolExecutor(max_workers=max_jobs)
+        self._futures: list[Future[None]] = []
+        self._lock = threading.Lock()
+        self.counts: Counter[Status] = Counter()
+
+    def submit(self, port: str, on_done: Callable[[Result], None] | None = None) -> None:
+        self._futures.append(self._pool.submit(self._update, port, on_done))
+
+    def _update(self, port: str, on_done: Callable[[Result], None] | None) -> None:
+        try:
+            time.sleep(self._settle_seconds)
+            result = flash_device(port, self._plan)
+        except Exception as exc:  # one device must never take the others down
+            result = Result(port, Status.FAILED, repr(exc))
+        with self._lock:
+            self.counts[result.status] += 1
+        try:
+            report(result)
+        finally:
+            if on_done is not None:
+                on_done(result)
+
+    def wait(self) -> None:
+        """Wait for every submitted update. Ctrl+C hands over to `stop`."""
+        try:
+            wait_for_futures(self._futures)
+        except KeyboardInterrupt:
+            self.stop()
+        else:
+            self._pool.shutdown()
+
+    def stop(self) -> None:
+        """Skip queued updates and let running ones finish. A second Ctrl+C kills them."""
+        print("\nStopping, waiting for running updates to finish (Ctrl+C again to abort)...")
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        try:
+            wait_for_futures(self._futures)
+        except KeyboardInterrupt:
+            print("Aborting. Interrupted CyberPis need to be flashed again.")
+            abort_esptools()
+            wait_for_futures(self._futures)
+        self._pool.shutdown()
+
+    def print_summary(self) -> None:
+        print(
+            f"\nSummary: {self.counts[Status.UPDATED]} updated, "
+            f"{self.counts[Status.UP_TO_DATE]} already up to date, "
+            f"{self.counts[Status.FAILED]} failed."
+        )
 
 
 # --------------------------------------------------------------------------- commands
 
 
-def cmd_fetch(args) -> int:
+def cmd_fetch(args: argparse.Namespace) -> int:
     fetch_firmware()
     return 0
 
 
-def cmd_list(args) -> int:
+def cmd_list(args: argparse.Namespace) -> int:
     ports = find_cyberpis()
     if not ports:
         print("No CyberPi found. Check the USB cable (it must carry data) and the CH340 driver.")
@@ -350,7 +574,7 @@ def cmd_list(args) -> int:
     return 0
 
 
-def cmd_flash(args) -> int:
+def cmd_flash(args: argparse.Namespace) -> int:
     firmware, label = resolve_firmware(args.firmware)
     ports = args.port or find_cyberpis()
     if not ports:
@@ -358,150 +582,161 @@ def cmd_flash(args) -> int:
         return 1
 
     print(f"Flashing firmware {label} to {len(ports)} CyberPi(s)...\n")
-    counts: Counter = Counter()
-    with ThreadPoolExecutor(max_workers=args.jobs or len(ports)) as pool:
-        futures = [pool.submit(flash_device, port, firmware, args) for port in ports]
-        for future in as_completed(futures):
-            result = future.result()
-            report(result)
-            counts[result.status] += 1
-    print_summary(counts)
-    return 1 if counts["failed"] else 0
+    runner = UpdateRunner(make_plan(firmware, args), max_jobs=args.jobs or len(ports))
+    for port in ports:
+        runner.submit(port)
+    runner.wait()
+    runner.print_summary()
+    return 1 if runner.counts[Status.FAILED] else 0
 
 
-def cmd_watch(args) -> int:
+def cmd_watch(args: argparse.Namespace) -> int:
     firmware, label = resolve_firmware(args.firmware)
+    runner = UpdateRunner(
+        make_plan(firmware, args), max_jobs=args.jobs or WATCH_MAX_JOBS, settle_seconds=args.settle
+    )
     print(f"Firmware {label}")
     print("Waiting for CyberPis. Plug them in; unplug each one once it says DONE.")
     print("Press Ctrl+C to stop.\n")
 
     lock = threading.Lock()
-    state: dict[str, str] = {}  # port -> "busy" or the final Result.status
-    counts: Counter = Counter()
-    pool = ThreadPoolExecutor(max_workers=args.jobs or 32)
+    state: dict[str, Status | None] = {}  # port -> final status, None while it is being flashed
 
-    def job(port: str) -> None:
-        time.sleep(args.settle)  # let the device finish enumerating
-        try:
-            result = flash_device(port, firmware, args)
-        except Exception as exc:  # never let one device take the station down
-            result = Result(port, "failed", repr(exc))
-        report(result)
-        if result.status == "failed":
-            say(port, "unplug and plug it back in to retry")
+    def on_done(result: Result) -> None:
         with lock:
-            state[port] = result.status
-            counts[result.status] += 1
+            state[result.port] = result.status
+        if result.status is Status.FAILED:
+            say(result.port, "unplug and plug it back in to retry")
 
     try:
         while True:
             present = set(find_cyberpis())
             with lock:
                 for port in sorted(present - state.keys()):
-                    state[port] = "busy"
+                    state[port] = None
                     say(port, "detected")
-                    pool.submit(job, port)
-                for port in [p for p, s in state.items() if p not in present and s != "busy"]:
+                    runner.submit(port, on_done)
+                for port in [p for p, s in state.items() if s is not None and p not in present]:
                     del state[port]
                     say(port, "unplugged")
-            time.sleep(1)
+            time.sleep(WATCH_POLL_SECONDS)
     except KeyboardInterrupt:
-        print("\nStopping, waiting for running updates to finish (Ctrl+C again to abort)...")
-        pool.shutdown(wait=True, cancel_futures=True)
-    print_summary(counts)
+        runner.stop()
+    runner.print_summary()
+    # Failed devices are retried by replugging them, so they don't fail the whole session.
     return 0
 
 
-def single_port(port: str | None) -> str:
-    if port:
-        return port
-    ports = find_cyberpis()
-    if len(ports) != 1:
-        found = "".join(f"\n  {p}" for p in ports)
-        sys.exit(f"Found {len(ports)} CyberPis. Plug in exactly one, or pick one with --port.{found}")
-    return ports[0]
-
-
-def cmd_backup(args) -> int:
+def cmd_backup(args: argparse.Namespace) -> int:
     port = single_port(args.port)
+    out = Path(args.out).expanduser().resolve() if args.out else None
+    if out and out.exists():
+        sys.exit(f"{out} already exists.")
+    stamp = timestamp()
     BACKUP_DIR.mkdir(exist_ok=True)
-    stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
     partial = BACKUP_DIR / f"incomplete_{stamp}.bin"
 
-    with open_log(port, "backup") as log:
-        say(port, f"reading all {FLASH_SIZE >> 20} MB of flash at {args.baud} baud...")
-        code, lines = run_esptool(port, args.baud, ["read-flash", "0", str(FLASH_SIZE), str(partial)], log)
-        if code != 0:
-            partial.unlink(missing_ok=True)
-            say(port, f"FAILED: {error_summary(lines)}  (log: {Path(log.name).relative_to(ROOT)})")
-            return 1
-        mac = device_mac(lines) or "unknown"
-        target = Path(args.out) if args.out else BACKUP_DIR / f"cyberpi_{mac.replace(':', '')}_{stamp}.bin"
-        partial.rename(target)
+    try:
+        with open_log(port, "backup") as log:
+            say(port, f"reading all {FLASH_SIZE >> 20} MB of flash at {args.baud} baud...")
+            read = ("read-flash", f"{FLASH_START:#x}", str(FLASH_SIZE), str(partial))
+            code, lines = run_esptool(port, args.baud, read, log)
+            if code != 0:
+                say(port, f"FAILED: {failure_detail(lines, log)}")
+                return 1
+            mac = device_mac(lines) or "unknown"
 
-        # Have the device hash its flash and compare it with the file we just wrote.
-        say(port, "checking the backup against the device...")
-        code, lines = run_esptool(port, args.baud, ["verify-flash", "0", str(target)], log)
-        if code != 0:
-            say(port, f"FAILED: the backup does not match the device: {error_summary(lines)}")
-            return 1
+            # Have the device hash its flash and compare it with the file we just wrote.
+            say(port, "checking the backup against the device...")
+            verify = ("verify-flash", f"{FLASH_START:#x}", str(partial))
+            code, lines = run_esptool(port, args.baud, verify, log)
+            if code != 0:
+                detail = failure_detail(lines, log)
+                say(port, f"FAILED: the backup does not match the device: {detail}")
+                return 1
 
-    md5 = hashlib.md5(target.read_bytes()).hexdigest()
-    say(port, f"DONE, backup of {mac} saved to {target.relative_to(ROOT)} (md5 {md5})")
-    return 0
+        target = out or BACKUP_DIR / f"cyberpi_{mac.replace(':', '')}_{stamp}.bin"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(partial, target)
+        md5 = hashlib.md5(target.read_bytes()).hexdigest()
+        say(port, f"DONE, backup of {mac} saved to {display_path(target)} (md5 {md5})")
+        return 0
+    finally:
+        partial.unlink(missing_ok=True)  # only still here if the backup failed or was interrupted
 
 
-def cmd_restore(args) -> int:
+def cmd_restore(args: argparse.Namespace) -> int:
     image = Path(args.backup).expanduser().resolve()
     if not image.is_file():
         sys.exit(f"Backup not found: {image}")
     if image.stat().st_size != FLASH_SIZE:
-        sys.exit(f"{image.name} is not a full CyberPi backup (expected exactly {FLASH_SIZE} bytes).")
+        sys.exit(f"{image.name} is not a full CyberPi backup (expected {FLASH_SIZE} bytes).")
     port = single_port(args.port)
 
     with open_log(port, "restore") as log:
         say(port, f"writing {image.name} at {args.baud} baud...")
-        code, lines = run_esptool(port, args.baud, ["write-flash", "0x0", str(image)], log)
+        write = ("write-flash", f"{FLASH_START:#x}", str(image))
+        code, lines = run_esptool(port, args.baud, write, log)
         if code != 0:
-            say(port, f"FAILED: {error_summary(lines)}  (log: {Path(log.name).relative_to(ROOT)})")
+            say(port, f"FAILED: {failure_detail(lines, log)}")
             return 1
     say(port, "DONE, backup restored and verified")
     return 0
 
 
-def main() -> int:
+# --------------------------------------------------------------------------- command line
+
+
+def positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Update the firmware of many Makeblock CyberPis over USB at once."
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("fetch", help="download the current CyberPi firmware from Makeblock")
-    sub.add_parser("list", help="list connected CyberPis")
+    sub.add_parser(
+        "fetch", help="download the current CyberPi firmware from Makeblock"
+    ).set_defaults(func=cmd_fetch)
+    sub.add_parser("list", help="list connected CyberPis").set_defaults(func=cmd_list)
 
     flash_opts = argparse.ArgumentParser(add_help=False)
     flash_opts.add_argument("--firmware", help="flash this image instead of the downloaded one")
     flash_opts.add_argument(
-        "--baud", type=int, default=DEFAULT_BAUD, help=f"flashing speed (default: {DEFAULT_BAUD})"
+        "--baud", type=positive_int, default=DEFAULT_BAUD,
+        help="flashing speed (default: %(default)s)",
     )
     flash_opts.add_argument(
-        "--fallback-baud", type=int, default=115200,
-        help="retry once at this speed if flashing fails, 0 to disable (default: 115200)",
+        "--fallback-baud", type=int, default=FALLBACK_BAUD,
+        help="retry once at this speed if flashing fails, 0 to disable (default: %(default)s)",
     )
-    flash_opts.add_argument("--jobs", type=int, default=0, help="max devices flashed at the same time")
+    flash_opts.add_argument(
+        "--jobs", type=positive_int, help="max devices flashed at the same time"
+    )
     flash_opts.add_argument(
         "--force", action="store_true",
-        help="reflash even if the device already has this firmware (also wipes its programs and settings)",
+        help="reflash even if the device already has this firmware "
+        "(also wipes its programs and settings)",
     )
 
     flash = sub.add_parser("flash", parents=[flash_opts], help="flash all connected CyberPis once")
     flash.add_argument("--port", action="append", help="only flash this port (repeatable)")
+    flash.set_defaults(func=cmd_flash)
 
     watch = sub.add_parser(
-        "watch", parents=[flash_opts], help="keep running and flash each CyberPi as it is plugged in"
+        "watch", parents=[flash_opts],
+        help="keep running and flash each CyberPi as it is plugged in",
     )
     watch.add_argument(
-        "--settle", type=float, default=1.5, help="seconds to wait after a device appears (default: 1.5)"
+        "--settle", type=float, default=WATCH_SETTLE_SECONDS,
+        help="seconds to wait after a device appears (default: %(default)s)",
     )
+    watch.set_defaults(func=cmd_watch)
 
     device_opts = argparse.ArgumentParser(add_help=False)
     device_opts.add_argument("--port", help="serial port (default: the only connected CyberPi)")
@@ -511,23 +746,31 @@ def main() -> int:
     )
     backup.add_argument("--out", help="file to write (default: backups/cyberpi_<mac>_<time>.bin)")
     backup.add_argument(
-        "--baud", type=int, default=READ_BAUD, help=f"transfer speed (default: {READ_BAUD})"
+        "--baud", type=positive_int, default=READ_BAUD, help="transfer speed (default: %(default)s)"
     )
+    backup.set_defaults(func=cmd_backup)
 
     restore = sub.add_parser(
         "restore", parents=[device_opts], help="write a backup back to one CyberPi"
     )
     restore.add_argument("backup", help="file created by the backup command")
     restore.add_argument(
-        "--baud", type=int, default=DEFAULT_BAUD, help=f"transfer speed (default: {DEFAULT_BAUD})"
+        "--baud", type=positive_int, default=DEFAULT_BAUD,
+        help="transfer speed (default: %(default)s)",
     )
+    restore.set_defaults(func=cmd_restore)
 
-    args = parser.parse_args()
-    commands = {
-        "fetch": cmd_fetch, "list": cmd_list, "flash": cmd_flash, "watch": cmd_watch,
-        "backup": cmd_backup, "restore": cmd_restore,
-    }
-    return commands[args.command](args)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    command: Callable[[argparse.Namespace], int] = args.func
+    try:
+        return command(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        return 130
 
 
 if __name__ == "__main__":

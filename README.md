@@ -63,6 +63,8 @@ Or run it as a station: it flashes each CyberPi as soon as you plug it in, and y
 
 A CyberPi that already runs the firmware shows `DONE, already had this firmware (left untouched)` after about 5 seconds.
 
+Ctrl+C stops `flash` and `watch` once the updates already running have finished. Press it a second time to abort those too; the interrupted CyberPis then need to be flashed again.
+
 Other commands and options:
 
 | | |
